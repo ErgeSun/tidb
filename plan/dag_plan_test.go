@@ -226,6 +226,11 @@ func (s *testPlanSuite) TestDAGPlanBuilderJoin(c *C) {
 			sql:  "select * from t t1 join t t2 on t1.b = t2.a order by t1.a limit 1",
 			best: "IndexJoin{TableReader(Table(t))->TableReader(Table(t))}(t1.b,t2.a)->Limit",
 		},
+		// Test hash join's hint.
+		{
+			sql:  "select /*+ TIDB_HJ(t1, t2) */ * from t t1 join t t2 on t1.b = t2.a order by t1.a limit 1",
+			best: "LeftHashJoin{TableReader(Table(t))->TableReader(Table(t))}(t1.b,t2.a)->TopN([t1.a],0,1)",
+		},
 		{
 			sql:  "select * from t t1 left join t t2 on t1.b = t2.a where 1 = 1 limit 1",
 			best: "IndexJoin{TableReader(Table(t)->Limit)->TableReader(Table(t))}(t1.b,t2.a)->Limit",
@@ -332,6 +337,10 @@ func (s *testPlanSuite) TestDAGPlanBuilderJoin(c *C) {
 		{
 			sql:  "select /*+ TIDB_INLJ(t1, t2) */ * from t t1 left outer join t t2 on t1.a = t2.a and t2.b < 1",
 			best: "IndexJoin{TableReader(Table(t))->TableReader(Table(t)->Sel([lt(t2.b, 1)]))}(t1.a,t2.a)",
+		},
+		{
+			sql:  "select /*+ TIDB_INLJ(t1, t2) */ * from t t1 join t t2 on t1.d=t2.d and t2.c = 1",
+			best: "IndexJoin{TableReader(Table(t))->IndexLookUp(Index(t.c_d_e)[[<nil>,+inf]], Table(t))}(t1.d,t2.d)",
 		},
 		// Test Index Join failed.
 		{
@@ -559,7 +568,7 @@ func (s *testPlanSuite) TestDAGPlanBuilderBasePhysicalPlan(c *C) {
 		// Test show.
 		{
 			sql:  "show tables",
-			best: "*plan.Show",
+			best: "Show",
 		},
 	}
 	for _, tt := range tests {

@@ -2620,7 +2620,9 @@ func (s *testIntegrationSuite) TestCompareBuiltin(c *C) {
 	tk.MustExec("drop table if exists t;")
 	tk.MustExec("create table t(a date)")
 	result = tk.MustQuery("desc select a = a from t")
-	result.Check(testkit.Rows("TableScan_3   cop table:t, range:(-inf,+inf), keep order:false 8000", "TableReader_4 Projection_2  root data:TableScan_3 8000", "Projection_2  TableReader_4 root eq(test.t.a, test.t.a) 8000"))
+	result.Check(testkit.Rows("TableScan_4   cop table:t, range:(-inf,+inf), keep order:false 8000",
+		"TableReader_5 Projection_3  root data:TableScan_4 8000",
+		"Projection_3  TableReader_5 root eq(test.t.a, test.t.a) 8000"))
 
 	// for interval
 	result = tk.MustQuery(`select interval(null, 1, 2), interval(1, 2, 3), interval(2, 1, 3)`)
@@ -2663,6 +2665,31 @@ func (s *testIntegrationSuite) TestAggregationBuiltin(c *C) {
 	tk.MustExec("insert into t values(1.123456), (1.123456)")
 	result := tk.MustQuery("select avg(a) from t")
 	result.Check(testkit.Rows("1.1234560000"))
+}
+
+func (s *testIntegrationSuite) TestAggregationBuiltinBitOr(c *C) {
+	defer s.cleanEnv(c)
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t;")
+	tk.MustExec("create table t(a bigint)")
+	tk.MustExec("insert into t values(null);")
+	result := tk.MustQuery("select bit_or(a) from t")
+	result.Check(testkit.Rows("0"))
+	tk.MustExec("insert into t values(1);")
+	result = tk.MustQuery("select bit_or(a) from t")
+	result.Check(testkit.Rows("1"))
+	tk.MustExec("insert into t values(2);")
+	result = tk.MustQuery("select bit_or(a) from t")
+	result.Check(testkit.Rows("3"))
+	tk.MustExec("insert into t values(4);")
+	result = tk.MustQuery("select bit_or(a) from t")
+	result.Check(testkit.Rows("7"))
+	result = tk.MustQuery("select a, bit_or(a) from t group by a order by a")
+	result.Check(testkit.Rows("<nil> 0", "1 1", "2 2", "4 4"))
+	tk.MustExec("insert into t values(-1);")
+	result = tk.MustQuery("select bit_or(a) from t")
+	result.Check(testkit.Rows("18446744073709551615"))
 }
 
 func (s *testIntegrationSuite) TestAggregationBuiltinBitXor(c *C) {
@@ -3115,6 +3142,12 @@ func (s *testIntegrationSuite) TestIssues(c *C) {
 	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|",
 		"Warning|1292|Truncated incorrect DOUBLE value: '1e649'",
 		"Warning|1292|Truncated incorrect DOUBLE value: '-1e649'"))
+
+	// for issue #5293
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int)")
+	tk.MustExec("insert t values (1)")
+	tk.MustQuery("select * from t where cast(a as binary)").Check(testkit.Rows("1"))
 }
 
 func newStoreWithBootstrap() (kv.Storage, *domain.Domain, error) {

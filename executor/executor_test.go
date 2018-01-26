@@ -16,7 +16,10 @@ package executor_test
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,18 +32,20 @@ import (
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/tikv"
-	mocktikv "github.com/pingcap/tidb/store/tikv/mocktikv"
+	"github.com/pingcap/tidb/store/tikv/mocktikv"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/admin"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
@@ -64,11 +69,15 @@ type testSuite struct {
 	mvccStore *mocktikv.MvccStore
 	store     kv.Storage
 	*parser.Parser
+
+	autoIDStep int64
 }
 
 var mockTikv = flag.Bool("mockTikv", true, "use mock tikv store in executor test")
 
 func (s *testSuite) SetUpSuite(c *C) {
+	s.autoIDStep = autoid.GetStep()
+	autoid.SetStep(5000)
 	s.Parser = parser.New()
 	flag.Lookup("mockTikv")
 	useMockTikv := *mockTikv
@@ -95,6 +104,7 @@ func (s *testSuite) SetUpSuite(c *C) {
 
 func (s *testSuite) TearDownSuite(c *C) {
 	s.store.Close()
+	autoid.SetStep(s.autoIDStep)
 }
 
 func (s *testSuite) SetUpTest(c *C) {
@@ -182,7 +192,7 @@ func (s *testSuite) TestAdmin(c *C) {
 	tb, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("admin_test"))
 	c.Assert(err, IsNil)
 	c.Assert(tb.Indices(), HasLen, 1)
-	_, err = tb.Indices()[0].Create(txn, types.MakeDatums(int64(10)), 1)
+	_, err = tb.Indices()[0].Create(mock.NewContext(), txn, types.MakeDatums(int64(10)), 1)
 	c.Assert(err, IsNil)
 	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
@@ -222,6 +232,7 @@ func checkCases(tests []testCase, ld *executor.LoadDataInfo,
 			c.Assert(data, DeepEquals, tt.restData,
 				Commentf("data1:%v, data2:%v, data:%v", string(tt.data1), string(tt.data2), string(data)))
 		}
+		terror.Log(ctx.StmtCommit())
 		err1 = ctx.Txn().Commit(goctx.Background())
 		c.Assert(err1, IsNil)
 		r := tk.MustQuery(selectSQL)
@@ -885,6 +896,13 @@ func (s *testSuite) TestUnion(c *C) {
 	// If set unspecified column flen to 0, it will cause bug in union.
 	// This test is used to prevent the bug reappear.
 	tk.MustQuery("select c from t1 union (select c from t2) order by c").Check(testkit.Rows("73", "930"))
+
+	// issue 5703
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a date)")
+	tk.MustExec("insert into t value ('2017-01-01'), ('2017-01-02')")
+	r = tk.MustQuery("(select a from t where a < 0) union (select a from t where a > 0) order by a")
+	r.Check(testkit.Rows("2017-01-01", "2017-01-02"))
 }
 
 func (s *testSuite) TestIn(c *C) {
@@ -1035,6 +1053,11 @@ func (s *testSuite) TestIndexScan(c *C) {
 	// Test for double read and top n.
 	result = tk.MustQuery("select a from t where c >= 2 order by b desc limit 1")
 	result.Check(testkit.Rows("5"))
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a varchar(50) primary key, b int, c int, index idx(b))")
+	tk.MustExec("insert into t values('aa', 1, 1)")
+	tk.MustQuery("select * from t use index(idx) where a > 'a'").Check(testkit.Rows("aa 1 1"))
 }
 
 func (s *testSuite) TestIndexReverseOrder(c *C) {
@@ -1519,6 +1542,8 @@ func (s *testSuite) TestTableScan(c *C) {
 	result.Check(testkit.Rows(rowStr1))
 	result = tk.MustQuery("select * from schemata where schema_name like 'my%'")
 	result.Check(testkit.Rows(rowStr1, rowStr2))
+	result = tk.MustQuery("select 1 from tables limit 1")
+	result.Check(testkit.Rows("1"))
 }
 
 func (s *testSuite) TestAdapterStatement(c *C) {
@@ -2291,4 +2316,50 @@ func (s *testSuite) TestTableScanWithPointRanges(c *C) {
 	tk.MustExec("create table t(id int, PRIMARY KEY (id))")
 	tk.MustExec("insert into t values(1), (5), (10)")
 	tk.MustQuery("select * from t where id in(1, 2, 10)").Check(testkit.Rows("1", "10"))
+}
+
+func (s *testSuite) TestUnsignedPk(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(id bigint unsigned primary key)")
+	var num1, num2 uint64 = math.MaxInt64 + 1, math.MaxInt64 + 2
+	tk.MustExec(fmt.Sprintf("insert into t values(%v), (%v), (1), (2)", num1, num2))
+	num1Str := strconv.FormatUint(num1, 10)
+	num2Str := strconv.FormatUint(num2, 10)
+	tk.MustQuery("select * from t order by id").Check(testkit.Rows("1", "2", num1Str, num2Str))
+	tk.MustQuery("select * from t where id not in (2)").Check(testkit.Rows(num1Str, num2Str, "1"))
+}
+
+func (s *testSuite) TestEarlyClose(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("create table earlyclose (id int primary key)")
+
+	// Insert 1000 rows.
+	var values []string
+	for i := 0; i < 1000; i++ {
+		values = append(values, fmt.Sprintf("(%d)", i))
+	}
+	tk.MustExec("insert earlyclose values " + strings.Join(values, ","))
+
+	// Get table ID for split.
+	dom := domain.GetDomain(tk.Se)
+	is := dom.InfoSchema()
+	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("earlyclose"))
+	c.Assert(err, IsNil)
+	tblID := tbl.Meta().ID
+
+	// Split the table.
+	s.cluster.SplitTable(s.mvccStore, tblID, 500)
+
+	goCtx := goctx.Background()
+	for i := 0; i < 500; i++ {
+		rss, err := tk.Se.Execute(goCtx, "select * from earlyclose order by id")
+		c.Assert(err, IsNil)
+		rs := rss[0]
+		_, err = rs.Next(goCtx)
+		c.Assert(err, IsNil)
+		rs.Close()
+	}
 }

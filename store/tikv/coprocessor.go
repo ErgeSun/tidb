@@ -19,6 +19,7 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/errors"
@@ -52,6 +53,11 @@ func (c *CopClient) IsRequestTypeSupported(reqType, subType int64) bool {
 			return c.supportExpr(tipb.ExprType(subType))
 		}
 	case kv.ReqTypeDAG:
+		// Now we only support pushing down stream aggregation on mocktikv.
+		// TODO: Remove it after TiKV supports stream aggregation.
+		if subType == kv.ReqSubTypeStreamAgg {
+			return c.store.mock
+		}
 		return c.supportExpr(tipb.ExprType(subType))
 	case kv.ReqTypeAnalyze:
 		return true
@@ -81,7 +87,8 @@ func (c *CopClient) supportExpr(exprType tipb.ExprType) bool {
 	case tipb.ExprType_Case, tipb.ExprType_If, tipb.ExprType_IfNull, tipb.ExprType_Coalesce:
 		return true
 	// aggregate functions.
-	case tipb.ExprType_Count, tipb.ExprType_First, tipb.ExprType_Max, tipb.ExprType_Min, tipb.ExprType_Sum, tipb.ExprType_Avg:
+	case tipb.ExprType_Count, tipb.ExprType_First, tipb.ExprType_Max, tipb.ExprType_Min, tipb.ExprType_Sum, tipb.ExprType_Avg,
+		tipb.ExprType_Agg_BitXor, tipb.ExprType_Agg_BitAnd, tipb.ExprType_Agg_BitOr:
 		return true
 	// json functions.
 	case tipb.ExprType_JsonType, tipb.ExprType_JsonExtract, tipb.ExprType_JsonUnquote,
@@ -339,6 +346,9 @@ type copIterator struct {
 	req         *kv.Request
 	concurrency int
 	finished    chan struct{}
+	// There are two cases we need to close the `finished` channel, one is when context is done, the other one is
+	// when the Close is called. we use atomic.CompareAndSwap `closed` to to make sure the channel is not closed twice.
+	closed uint32
 
 	// If keepOrder, results are stored in copTask.respChan, read them out one by one.
 	tasks []*copTask
@@ -389,8 +399,6 @@ func (it *copIterator) work(goCtx goctx.Context, taskCh <-chan *copTask) {
 		select {
 		case <-it.finished:
 			return
-		case <-goCtx.Done():
-			return
 		default:
 		}
 	}
@@ -402,18 +410,14 @@ func (it *copIterator) run(ctx goctx.Context) {
 	// Start it.concurrency number of workers to handle cop requests.
 	for i := 0; i < it.concurrency; i++ {
 		copIteratorGP.Go(func() {
-			childCtx, cancel := goctx.WithCancel(ctx)
-			defer cancel()
-			it.work(childCtx, taskCh)
+			it.work(ctx, taskCh)
 		})
 	}
 
 	copIteratorGP.Go(func() {
 		// Send tasks to feed the worker goroutines.
-		childCtx, cancel := goctx.WithCancel(ctx)
-		defer cancel()
 		for _, t := range it.tasks {
-			exit := it.sendToTaskCh(childCtx, t, taskCh)
+			exit := it.sendToTaskCh(t, taskCh)
 			if exit {
 				break
 			}
@@ -428,30 +432,43 @@ func (it *copIterator) run(ctx goctx.Context) {
 	})
 }
 
-func (it *copIterator) sendToTaskCh(ctx goctx.Context, t *copTask, taskCh chan<- *copTask) (exit bool) {
+func (it *copIterator) recvFromRespCh(ctx goctx.Context, respCh <-chan copResponse) (resp copResponse, ok bool, exit bool) {
 	select {
-	case taskCh <- t:
+	case resp, ok = <-respCh:
 	case <-it.finished:
 		exit = true
 	case <-ctx.Done():
+		// We select the ctx.Done() in the thread of `Next` instead of in the worker to avoid the cost of `WithCancel`.
+		if atomic.CompareAndSwapUint32(&it.closed, 0, 1) {
+			close(it.finished)
+		}
 		exit = true
 	}
 	return
 }
 
-func (it *copIterator) sendToRespCh(goCtx goctx.Context, resp copResponse, respCh chan copResponse) (exit bool) {
+func (it *copIterator) sendToTaskCh(t *copTask, taskCh chan<- *copTask) (exit bool) {
+	select {
+	case taskCh <- t:
+	case <-it.finished:
+		exit = true
+	}
+	return
+}
+
+func (it *copIterator) sendToRespCh(resp copResponse, respCh chan copResponse) (exit bool) {
 	select {
 	case respCh <- resp:
 	case <-it.finished:
-		exit = true
-	case <-goCtx.Done():
 		exit = true
 	}
 	return
 }
 
 // Next returns next coprocessor result.
-func (it *copIterator) Next() ([]byte, error) {
+// NOTE: Use nil to indicate finish, so if the returned values is a slice with
+// size 0, reader should continue to call Next().
+func (it *copIterator) Next(ctx goctx.Context) ([]byte, error) {
 	coprocessorCounter.WithLabelValues("next").Inc()
 
 	var (
@@ -467,13 +484,18 @@ func (it *copIterator) Next() ([]byte, error) {
 			return nil, nil
 		}
 	} else {
+		var closed bool
 		for {
 			if it.curr >= len(it.tasks) {
 				// Resp will be nil if iterator is finished.
 				return nil, nil
 			}
 			task := it.tasks[it.curr]
-			resp, ok = <-task.respChan
+			resp, ok, closed = it.recvFromRespCh(ctx, task.respChan)
+			if closed {
+				// Close() is already called, so Next() is invalid.
+				return nil, nil
+			}
 			if ok {
 				break
 			}
@@ -532,7 +554,19 @@ func (it *copIterator) handleTaskOnce(bo *Backoffer, task *copTask, ch chan copR
 			NotFillCache:   it.req.NotFillCache,
 		},
 	}
-	resp, err := sender.SendReq(bo, req, task.region, ReadTimeoutMedium)
+	timeout := ReadTimeoutMedium
+	if task.cmdType == tikvrpc.CmdCopStream {
+		// Don't set timeout for streaming, because we use context cancel to implement timeout,
+		// but call cancel() would kill the stream:
+		//
+		//     context, cancel := goctx.WithTimeout(bo, timeout)
+		//     defer cancel()
+		//     resp := client.SendReq(context, ...)
+		//
+		// The resp is a stream and killed by cancel operation immediately.
+		timeout = 0
+	}
+	resp, err := sender.SendReq(bo, req, task.region, timeout)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -593,7 +627,7 @@ func (it *copIterator) handleCopResponse(bo *Backoffer, resp *coprocessor.Respon
 		log.Warnf("coprocessor err: %v", err)
 		return nil, errors.Trace(err)
 	}
-	it.sendToRespCh(bo, copResponse{resp, nil}, ch)
+	it.sendToRespCh(copResponse{resp, nil}, ch)
 	return nil, nil
 }
 
@@ -622,7 +656,9 @@ func calculateRemain(ranges *copRanges, split *coprocessor.KeyRange, desc bool) 
 }
 
 func (it *copIterator) Close() error {
-	close(it.finished)
+	if atomic.CompareAndSwapUint32(&it.closed, 0, 1) {
+		close(it.finished)
+	}
 	it.wg.Wait()
 	return nil
 }
@@ -630,7 +666,7 @@ func (it *copIterator) Close() error {
 // copErrorResponse returns error when calling Next()
 type copErrorResponse struct{ error }
 
-func (it copErrorResponse) Next() ([]byte, error) {
+func (it copErrorResponse) Next(ctx goctx.Context) ([]byte, error) {
 	return nil, it.error
 }
 

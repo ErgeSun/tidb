@@ -177,10 +177,12 @@ import (
 	or			"OR"
 	order			"ORDER"
 	outer			"OUTER"
+	packKeys		"PACK_KEYS"
 	partition		"PARTITION"
 	precisionType		"PRECISION"
 	primary			"PRIMARY"
 	procedure		"PROCEDURE"
+	shardRowIDBits		"SHARD_ROW_ID_BITS"
 	rangeKwd		"RANGE"
 	read			"READ"
 	realType		"REAL"
@@ -541,7 +543,7 @@ import (
 	ShowStmt			"Show engines/databases/tables/columns/warnings/status statement"
 	Statement			"statement"
 	ExplainableStmt			"explainable statement"
-	TruncateTableStmt		"TRANSACTION TABLE statement"
+	TruncateTableStmt		"TRUNCATE TABLE statement"
 	UnlockTablesStmt		"Unlock tables statement"
 	UpdateStmt			"UPDATE statement"
 	UnionStmt			"Union select state ment"
@@ -3217,6 +3219,22 @@ FunctionCallKeyword:
 	{
 		$$ = &ast.FuncCallExpr{FnName:model.NewCIStr(ast.PasswordFunc), Args: $3.([]ast.ExprNode)}
 	}
+|	'{' Identifier stringLit '}'
+	{
+		// This is ODBC syntax.
+		// See: https://dev.mysql.com/doc/refman/5.7/en/date-and-time-literals.html
+		expr := ast.NewValueExpr($3)
+		tp := $2
+		if tp == "ts" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.TimestampLiteral), Args: []ast.ExprNode{expr}}
+		} else if tp == "t" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.TimeLiteral), Args: []ast.ExprNode{expr}}
+		} else if tp == "d" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.DateLiteral), Args: []ast.ExprNode{expr}}
+		} else {
+			$$ = expr
+		}
+	}
 
 FunctionCallNonKeyword:
 	builtinCurTime '(' FuncDatetimePrecListOpt ')'
@@ -4474,7 +4492,7 @@ TransactionChars:
 	TransactionChar
 	{
 		if $1 != nil {
-			$$ = []*ast.VariableAssignment{$1.(*ast.VariableAssignment)}
+			$$ = $1
 		} else {
 			$$ = []*ast.VariableAssignment{}
 		}
@@ -4482,7 +4500,8 @@ TransactionChars:
 |	TransactionChars ',' TransactionChar
 	{
 		if $3 != nil {
-			$$ = append($1.([]*ast.VariableAssignment), $3.(*ast.VariableAssignment))
+			varAssigns := $3.([]*ast.VariableAssignment)
+			$$ = append($1.([]*ast.VariableAssignment), varAssigns...)
 		} else {
 			$$ = $1
 		}
@@ -4491,18 +4510,24 @@ TransactionChars:
 TransactionChar:
 	"ISOLATION" "LEVEL" IsolationLevel
 	{
+		varAssigns := []*ast.VariableAssignment{}
 		expr := ast.NewValueExpr($3)
-		$$ = &ast.VariableAssignment{Name: "tx_isolation", Value: expr, IsSystem: true}
+		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "tx_isolation", Value: expr, IsSystem: true})
+		$$ = varAssigns
 	}
 |	"READ" "WRITE"
 	{
-		// Parsed but ignored
-		$$ = nil
+		varAssigns := []*ast.VariableAssignment{}
+		expr := ast.NewValueExpr("0")
+		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "tx_read_only", Value: expr, IsSystem: true})
+		$$ = varAssigns
 	}
 |	"READ" "ONLY"
 	{
-		// Parsed but ignored
-		$$ = nil
+		varAssigns := []*ast.VariableAssignment{}
+		expr := ast.NewValueExpr("1")
+		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "tx_read_only", Value: expr, IsSystem: true})
+		$$ = varAssigns
 	}
 
 IsolationLevel:
@@ -5262,6 +5287,15 @@ TableOption:
 |	"STATS_PERSISTENT" EqOpt StatsPersistentVal
 	{
 		$$ = &ast.TableOption{Tp: ast.TableOptionStatsPersistent}
+	}
+|	"SHARD_ROW_ID_BITS" EqOpt LengthNum
+	{
+		$$ = &ast.TableOption{Tp: ast.TableOptionShardRowID, UintValue: $3.(uint64)}
+	}
+|	"PACK_KEYS" EqOpt StatsPersistentVal
+	{
+		// Parse it but will ignore it.
+		$$ = &ast.TableOption{Tp: ast.TableOptionPackKeys}
 	}
 
 StatsPersistentVal:

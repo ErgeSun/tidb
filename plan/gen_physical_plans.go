@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
@@ -28,8 +29,7 @@ import (
 )
 
 func (p *LogicalUnionScan) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
-	us := PhysicalUnionScan{Conditions: p.conditions}.init(p.ctx, prop)
-	us.SetSchema(p.schema)
+	us := PhysicalUnionScan{Conditions: p.conditions}.init(p.ctx, p.stats, prop)
 	return []PhysicalPlan{us}
 }
 
@@ -161,7 +161,7 @@ func (p *LogicalJoin) getHashJoins(prop *requiredProp) []PhysicalPlan {
 	return joins
 }
 
-func (p *LogicalJoin) getHashJoin(prop *requiredProp, innerIdx int) PhysicalPlan {
+func (p *LogicalJoin) getHashJoin(prop *requiredProp, innerIdx int) *PhysicalHashJoin {
 	chReqProps := make([]*requiredProp, 2)
 	chReqProps[innerIdx] = &requiredProp{expectedCnt: math.MaxFloat64}
 	chReqProps[1-innerIdx] = &requiredProp{expectedCnt: prop.expectedCnt}
@@ -210,7 +210,7 @@ func joinKeyMatchIndexCol(key *expression.Column, indexCols []*expression.Column
 
 // When inner plan is TableReader, the last two parameter will be nil
 func (p *LogicalJoin) constructIndexJoin(prop *requiredProp, innerJoinKeys, outerJoinKeys []*expression.Column, outerIdx int,
-	innerPlan PhysicalPlan, ranges []*ranger.IndexRange, keyOff2IdxOff []int) []PhysicalPlan {
+	innerPlan PhysicalPlan, ranges []*ranger.NewRange, keyOff2IdxOff []int) []PhysicalPlan {
 	joinType := p.JoinType
 	outerSchema := p.children[outerIdx].Schema()
 	// If the order by columns are not all from outer child, index join cannot promise the order.
@@ -233,9 +233,6 @@ func (p *LogicalJoin) constructIndexJoin(prop *requiredProp, innerJoinKeys, oute
 		Ranges:          ranges,
 	}.init(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), chReqProps...)
 	join.SetSchema(p.schema)
-	if !prop.isEmpty() {
-		join.KeepOrder = true
-	}
 	return []PhysicalPlan{join}
 }
 
@@ -244,7 +241,7 @@ func (p *LogicalJoin) constructIndexJoin(prop *requiredProp, innerJoinKeys, oute
 // Then, we will extract the join keys of p's equal conditions. Then check whether all of them are just the primary key
 // or match some part of on index. If so we will choose the best one and construct a index join.
 func (p *LogicalJoin) getIndexJoinByOuterIdx(prop *requiredProp, outerIdx int) []PhysicalPlan {
-	innerChild := p.children[1-outerIdx].(LogicalPlan)
+	innerChild := p.children[1-outerIdx]
 	var (
 		innerJoinKeys []*expression.Column
 		outerJoinKeys []*expression.Column
@@ -265,13 +262,13 @@ func (p *LogicalJoin) getIndexJoinByOuterIdx(prop *requiredProp, outerIdx int) [
 	if includeTableScan && len(innerJoinKeys) == 1 {
 		pkCol := x.getPKIsHandleCol()
 		if pkCol != nil && innerJoinKeys[0].Equal(pkCol, nil) {
-			innerPlan := x.forceToTableScan()
+			innerPlan := x.forceToTableScan(pkCol)
 			return p.constructIndexJoin(prop, innerJoinKeys, outerJoinKeys, outerIdx, innerPlan, nil, nil)
 		}
 	}
 	var (
 		bestIndexInfo  *model.IndexInfo
-		rangesOfBest   []*ranger.IndexRange
+		rangesOfBest   []*ranger.NewRange
 		maxUsedCols    int
 		remainedOfBest []expression.Expression
 		keyOff2IdxOff  []int
@@ -299,7 +296,7 @@ func (p *LogicalJoin) getIndexJoinByOuterIdx(prop *requiredProp, outerIdx int) [
 // buildRangeForIndexJoin checks whether this index can be used for building index join and return the range if this index is ok.
 // If this index is invalid, just return nil range.
 func (p *LogicalJoin) buildRangeForIndexJoin(indexInfo *model.IndexInfo, innerPlan *DataSource, innerJoinKeys []*expression.Column) (
-	indexRanges []*ranger.IndexRange, remained []expression.Expression, keyOff2IdxOff []int) {
+	[]*ranger.NewRange, []expression.Expression, []int) {
 	idxCols, colLengths := expression.IndexInfo2Cols(innerPlan.Schema().Columns, indexInfo)
 	if len(idxCols) == 0 {
 		return nil, nil, nil
@@ -312,13 +309,12 @@ func (p *LogicalJoin) buildRangeForIndexJoin(indexInfo *model.IndexInfo, innerPl
 		return nil, nil, nil
 	}
 
-	ranges, err := ranger.BuildRange(p.ctx.GetSessionVars().StmtCtx, accesses, ranger.IndexRangeType, idxCols, colLengths)
+	ranges, err := ranger.BuildIndexRange(p.ctx.GetSessionVars().StmtCtx, idxCols, colLengths, accesses)
 	if err != nil {
 		terror.Log(errors.Trace(err))
 		return nil, nil, nil
 	}
-	indexRanges = ranger.Ranges2IndexRanges(ranges)
-	return indexRanges, remained, keyOff2IdxOff
+	return ranges, remained, keyOff2IdxOff
 }
 
 func (p *LogicalJoin) buildAccessCondsForIndexJoin(keys, idxCols []*expression.Column, colLengths []int,
@@ -468,127 +464,140 @@ func (p *LogicalProjection) genPhysPlansByReqProp(prop *requiredProp) []Physical
 	return []PhysicalPlan{proj}
 }
 
-func (p *LogicalTopN) getPhysTopN() []PhysicalPlan {
+func (lt *LogicalTopN) getPhysTopN() []PhysicalPlan {
 	ret := make([]PhysicalPlan, 0, 3)
 	for _, tp := range wholeTaskTypes {
 		resultProp := &requiredProp{taskTp: tp, expectedCnt: math.MaxFloat64}
 		topN := PhysicalTopN{
-			ByItems: p.ByItems,
-			Count:   p.Count,
-			Offset:  p.Offset,
-			partial: p.partial,
-		}.init(p.ctx, p.stats, resultProp)
-		topN.SetSchema(p.schema)
+			ByItems: lt.ByItems,
+			Count:   lt.Count,
+			Offset:  lt.Offset,
+			partial: lt.partial,
+		}.init(lt.ctx, lt.stats, resultProp)
 		ret = append(ret, topN)
 	}
 	return ret
 }
 
-func (p *LogicalTopN) getPhysLimits() []PhysicalPlan {
-	prop, canPass := getPropByOrderByItems(p.ByItems)
+func (lt *LogicalTopN) getPhysLimits() []PhysicalPlan {
+	prop, canPass := getPropByOrderByItems(lt.ByItems)
 	if !canPass {
 		return nil
 	}
 	ret := make([]PhysicalPlan, 0, 3)
 	for _, tp := range wholeTaskTypes {
-		resultProp := &requiredProp{taskTp: tp, expectedCnt: float64(p.Count + p.Offset), cols: prop.cols, desc: prop.desc}
+		resultProp := &requiredProp{taskTp: tp, expectedCnt: float64(lt.Count + lt.Offset), cols: prop.cols, desc: prop.desc}
 		limit := PhysicalLimit{
-			Count:   p.Count,
-			Offset:  p.Offset,
-			partial: p.partial,
-		}.init(p.ctx, p.stats, resultProp)
-		limit.SetSchema(p.schema)
+			Count:   lt.Count,
+			Offset:  lt.Offset,
+			partial: lt.partial,
+		}.init(lt.ctx, lt.stats, resultProp)
 		ret = append(ret, limit)
 	}
 	return ret
 }
 
-func (p *LogicalTopN) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
-	if prop.matchItems(p.ByItems) {
-		return append(p.getPhysTopN(), p.getPhysLimits()...)
+func (lt *LogicalTopN) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
+	if prop.matchItems(lt.ByItems) {
+		return append(lt.getPhysTopN(), lt.getPhysLimits()...)
 	}
 	return nil
 }
 
-func (p *LogicalApply) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
-	if !prop.allColsFromSchema(p.children[0].Schema()) { // for convenient, we don't pass through any prop
+func (la *LogicalApply) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
+	if !prop.allColsFromSchema(la.children[0].Schema()) { // for convenient, we don't pass through any prop
 		return nil
 	}
 	apply := PhysicalApply{
-		PhysicalJoin:  p.getHashJoin(prop, 1),
-		OuterSchema:   p.corCols,
-		rightChOffset: p.children[0].Schema().Len(),
-	}.init(p.ctx,
-		p.stats.scaleByExpectCnt(prop.expectedCnt),
+		PhysicalJoin:  la.getHashJoin(prop, 1),
+		OuterSchema:   la.corCols,
+		rightChOffset: la.children[0].Schema().Len(),
+	}.init(la.ctx,
+		la.stats.scaleByExpectCnt(prop.expectedCnt),
 		&requiredProp{expectedCnt: math.MaxFloat64, cols: prop.cols, desc: prop.desc},
 		&requiredProp{expectedCnt: math.MaxFloat64})
-	apply.SetSchema(p.schema)
+	apply.SetSchema(la.schema)
 	return []PhysicalPlan{apply}
 }
 
-// genPhysPlansByReqProp is only for implementing interface. DataSource and Dual generate task in `convert2NewPhysicalPlan` directly.
+// genPhysPlansByReqProp is only for implementing interface. DataSource and Dual generate task in `convert2PhysicalPlan` directly.
 func (p *baseLogicalPlan) genPhysPlansByReqProp(_ *requiredProp) []PhysicalPlan {
 	panic("This function should not be called")
 }
 
-func (p *LogicalAggregation) getStreamAggs(prop *requiredProp) []PhysicalPlan {
-	if len(p.possibleProperties) == 0 {
+func (la *LogicalAggregation) getStreamAggs(prop *requiredProp) []PhysicalPlan {
+	if len(la.possibleProperties) == 0 {
 		return nil
 	}
-	for _, aggFunc := range p.AggFuncs {
-		if aggFunc.GetMode() == aggregation.FinalMode {
+	for _, aggFunc := range la.AggFuncs {
+		if aggFunc.Mode == aggregation.FinalMode {
 			return nil
 		}
 	}
 	// group by a + b is not interested in any order.
-	if len(p.groupByCols) != len(p.GroupByItems) {
+	if len(la.groupByCols) != len(la.GroupByItems) {
 		return nil
 	}
-	streamAggs := make([]PhysicalPlan, 0, len(p.possibleProperties))
-	for _, cols := range p.possibleProperties {
-		_, keys := getPermutation(cols, p.groupByCols)
-		if len(keys) != len(p.groupByCols) {
+	streamAggs := make([]PhysicalPlan, 0, len(la.possibleProperties)*2)
+	for _, cols := range la.possibleProperties {
+		_, keys := getPermutation(cols, la.groupByCols)
+		if len(keys) != len(la.groupByCols) {
 			continue
 		}
-		childProp := &requiredProp{
-			cols:        keys,
-			desc:        prop.desc,
-			expectedCnt: prop.expectedCnt * p.inputCount / p.stats.count,
+		for _, tp := range wholeTaskTypes {
+			// Second read in the double can't meet the stream aggregation's require prop.
+			if tp == copDoubleReadTaskType {
+				continue
+			}
+			// Now we only support pushing down stream aggregation on mocktikv.
+			// TODO: Remove it after TiKV supports stream aggregation.
+			if tp == copSingleReadTaskType {
+				client := la.ctx.GetClient()
+				if !client.IsRequestTypeSupported(kv.ReqTypeDAG, kv.ReqSubTypeStreamAgg) {
+					continue
+				}
+			}
+			childProp := &requiredProp{
+				taskTp:      tp,
+				cols:        keys,
+				desc:        prop.desc,
+				expectedCnt: prop.expectedCnt * la.inputCount / la.stats.count,
+			}
+			if !prop.isPrefix(childProp) {
+				continue
+			}
+			agg := basePhysicalAgg{
+				GroupByItems: la.GroupByItems,
+				AggFuncs:     la.AggFuncs,
+			}.initForStream(la.ctx, la.stats.scaleByExpectCnt(prop.expectedCnt), childProp)
+			agg.SetSchema(la.schema.Clone())
+			streamAggs = append(streamAggs, agg)
 		}
-		if !prop.isPrefix(childProp) {
-			continue
-		}
-		agg := basePhysicalAgg{
-			GroupByItems: p.GroupByItems,
-			AggFuncs:     p.AggFuncs,
-		}.initForStream(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), childProp)
-		agg.SetSchema(p.schema.Clone())
-		streamAggs = append(streamAggs, agg)
 	}
 	return streamAggs
 }
 
-func (p *LogicalAggregation) getHashAggs(prop *requiredProp) []PhysicalPlan {
+func (la *LogicalAggregation) getHashAggs(prop *requiredProp) []PhysicalPlan {
 	if !prop.isEmpty() {
 		return nil
 	}
 	hashAggs := make([]PhysicalPlan, 0, len(wholeTaskTypes))
 	for _, taskTp := range wholeTaskTypes {
 		agg := basePhysicalAgg{
-			GroupByItems: p.GroupByItems,
-			AggFuncs:     p.AggFuncs,
-		}.initForHash(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), &requiredProp{expectedCnt: math.MaxFloat64, taskTp: taskTp})
-		agg.SetSchema(p.schema.Clone())
+			GroupByItems: la.GroupByItems,
+			AggFuncs:     la.AggFuncs,
+		}.initForHash(la.ctx, la.stats.scaleByExpectCnt(prop.expectedCnt), &requiredProp{expectedCnt: math.MaxFloat64, taskTp: taskTp})
+		agg.SetSchema(la.schema.Clone())
 		hashAggs = append(hashAggs, agg)
 	}
 	return hashAggs
 }
 
-func (p *LogicalAggregation) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
-	aggs := make([]PhysicalPlan, 0, len(p.possibleProperties)+1)
-	aggs = append(aggs, p.getHashAggs(prop)...)
+func (la *LogicalAggregation) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
+	aggs := make([]PhysicalPlan, 0, len(la.possibleProperties)+1)
+	aggs = append(aggs, la.getHashAggs(prop)...)
 
-	streamAggs := p.getStreamAggs(prop)
+	streamAggs := la.getStreamAggs(prop)
 	aggs = append(aggs, streamAggs...)
 
 	return aggs
@@ -598,7 +607,6 @@ func (p *LogicalSelection) genPhysPlansByReqProp(prop *requiredProp) []PhysicalP
 	sel := PhysicalSelection{
 		Conditions: p.Conditions,
 	}.init(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), prop)
-	sel.SetSchema(p.Schema())
 	return []PhysicalPlan{sel}
 }
 
@@ -614,7 +622,6 @@ func (p *LogicalLimit) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan 
 			Count:   p.Count,
 			partial: p.partial,
 		}.init(p.ctx, p.stats, resultProp)
-		limit.SetSchema(p.Schema())
 		ret = append(ret, limit)
 	}
 	return ret
@@ -624,7 +631,6 @@ func (p *LogicalLock) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
 	lock := PhysicalLock{
 		Lock: p.Lock,
 	}.init(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), prop)
-	lock.SetSchema(p.schema)
 	return []PhysicalPlan{lock}
 }
 
@@ -638,31 +644,29 @@ func (p *LogicalUnionAll) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPl
 		chReqProps = append(chReqProps, &requiredProp{expectedCnt: prop.expectedCnt})
 	}
 	ua := PhysicalUnionAll{}.init(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), chReqProps...)
-	ua.SetSchema(p.schema)
 	return []PhysicalPlan{ua}
 }
 
-func (p *LogicalSort) getPhysicalSort(prop *requiredProp) *PhysicalSort {
-	ps := PhysicalSort{ByItems: p.ByItems}.init(p.ctx, p.stats.scaleByExpectCnt(prop.expectedCnt), &requiredProp{expectedCnt: math.MaxFloat64})
-	ps.SetSchema(p.schema)
+func (ls *LogicalSort) getPhysicalSort(prop *requiredProp) *PhysicalSort {
+	ps := PhysicalSort{ByItems: ls.ByItems}.init(ls.ctx, ls.stats.scaleByExpectCnt(prop.expectedCnt), &requiredProp{expectedCnt: math.MaxFloat64})
 	return ps
 }
 
-func (p *LogicalSort) getNominalSort(reqProp *requiredProp) *NominalSort {
-	prop, canPass := getPropByOrderByItems(p.ByItems)
+func (ls *LogicalSort) getNominalSort(reqProp *requiredProp) *NominalSort {
+	prop, canPass := getPropByOrderByItems(ls.ByItems)
 	if !canPass {
 		return nil
 	}
 	prop.expectedCnt = reqProp.expectedCnt
-	ps := NominalSort{}.init(p.ctx, prop)
+	ps := NominalSort{}.init(ls.ctx, prop)
 	return ps
 }
 
-func (p *LogicalSort) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
-	if prop.matchItems(p.ByItems) {
+func (ls *LogicalSort) genPhysPlansByReqProp(prop *requiredProp) []PhysicalPlan {
+	if prop.matchItems(ls.ByItems) {
 		ret := make([]PhysicalPlan, 0, 2)
-		ret = append(ret, p.getPhysicalSort(prop))
-		ns := p.getNominalSort(prop)
+		ret = append(ret, ls.getPhysicalSort(prop))
+		ns := ls.getNominalSort(prop)
 		if ns != nil {
 			ret = append(ret, ns)
 		}
@@ -685,6 +689,5 @@ func (p *LogicalMaxOneRow) genPhysPlansByReqProp(prop *requiredProp) []PhysicalP
 		return nil
 	}
 	mor := PhysicalMaxOneRow{}.init(p.ctx, p.stats, &requiredProp{expectedCnt: 2})
-	mor.SetSchema(p.schema)
 	return []PhysicalPlan{mor}
 }

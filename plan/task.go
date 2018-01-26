@@ -129,6 +129,7 @@ func (p *PhysicalApply) attach2Task(tasks ...task) task {
 	rTask := finishCopTask(tasks[1].copy(), p.ctx)
 	p.SetChildren(lTask.plan(), rTask.plan())
 	p.PhysicalJoin.SetChildren(lTask.plan(), rTask.plan())
+	p.schema = buildPhysicalJoinSchema(p.PhysicalJoin.JoinType, p)
 	return &rootTask{
 		p:   p,
 		cst: lTask.cost() + lTask.count()*rTask.cost(),
@@ -145,6 +146,7 @@ func (p *PhysicalIndexJoin) attach2Task(tasks ...task) task {
 	} else {
 		p.SetChildren(p.innerPlan, outerTask.plan())
 	}
+	p.schema = buildPhysicalJoinSchema(p.JoinType, p)
 	return &rootTask{
 		p:   p,
 		cst: outerTask.cost() + p.getCost(outerTask.count()),
@@ -157,14 +159,8 @@ func (p *PhysicalIndexJoin) getCost(lCnt float64) float64 {
 	}
 	cst := lCnt * netWorkFactor
 	batchSize := p.ctx.GetSessionVars().IndexJoinBatchSize
-	if p.KeepOrder {
-		batchSize = 1
-	}
 	cst += lCnt * math.Log2(math.Min(float64(batchSize), lCnt)) * 2
 	cst += lCnt / float64(batchSize) * netWorkStartFactor
-	if p.KeepOrder {
-		return cst * 2
-	}
 	return cst
 }
 
@@ -186,6 +182,7 @@ func (p *PhysicalHashJoin) attach2Task(tasks ...task) task {
 	lTask := finishCopTask(tasks[0].copy(), p.ctx)
 	rTask := finishCopTask(tasks[1].copy(), p.ctx)
 	p.SetChildren(lTask.plan(), rTask.plan())
+	p.schema = buildPhysicalJoinSchema(p.JoinType, p)
 	return &rootTask{
 		p:   p,
 		cst: lTask.cost() + rTask.cost() + p.getCost(lTask.count(), rTask.count()),
@@ -203,6 +200,7 @@ func (p *PhysicalMergeJoin) attach2Task(tasks ...task) task {
 	lTask := finishCopTask(tasks[0].copy(), p.ctx)
 	rTask := finishCopTask(tasks[1].copy(), p.ctx)
 	p.SetChildren(lTask.plan(), rTask.plan())
+	p.schema = buildPhysicalJoinSchema(p.JoinType, p)
 	return &rootTask{
 		p:   p,
 		cst: lTask.cost() + rTask.cost() + p.getCost(lTask.count(), rTask.count()),
@@ -280,11 +278,6 @@ func (p *PhysicalLimit) attach2Task(tasks ...task) task {
 		if !cop.keepOrder || !cop.indexPlanFinished || cop.indexPlan == nil {
 			// When limit be pushed down, it should remove its offset.
 			pushedDownLimit := PhysicalLimit{Count: p.Offset + p.Count}.init(p.ctx, p.stats)
-			if cop.tablePlan != nil {
-				pushedDownLimit.SetSchema(cop.tablePlan.Schema())
-			} else {
-				pushedDownLimit.SetSchema(cop.indexPlan.Schema())
-			}
 			cop = attachPlan2Task(pushedDownLimit, cop).(*copTask)
 		}
 		t = finishCopTask(cop, p.ctx)
@@ -362,14 +355,12 @@ func (p *PhysicalTopN) attach2Task(tasks ...task) task {
 		// If all columns in topN are from index plan, we can push it to index plan. Or we finish the index plan and
 		// push it to table plan.
 		if !copTask.indexPlanFinished && p.allColsFromSchema(copTask.indexPlan.Schema()) {
-			pushedDownTopN.SetSchema(copTask.indexPlan.Schema())
 			pushedDownTopN.SetChildren(copTask.indexPlan)
 			copTask.indexPlan = pushedDownTopN
 		} else {
 			// FIXME: When we pushed down a top-N plan to table plan branch in case of double reading. The cost should
 			// be more expensive in case of single reading, because we may execute table scan multi times.
 			copTask.finishIndexPlan()
-			pushedDownTopN.SetSchema(copTask.tablePlan.Schema())
 			pushedDownTopN.SetChildren(copTask.tablePlan)
 			copTask.tablePlan = pushedDownTopN
 		}
@@ -402,7 +393,7 @@ func (p *PhysicalProjection) attach2Task(tasks ...task) task {
 
 func (p *PhysicalUnionAll) attach2Task(tasks ...task) task {
 	newTask := &rootTask{p: p}
-	newChildren := make([]Plan, 0, len(p.children))
+	newChildren := make([]PhysicalPlan, 0, len(p.children))
 	for _, task := range tasks {
 		if task.invalid() {
 			return invalidTask
@@ -425,65 +416,89 @@ func (sel *PhysicalSelection) attach2Task(tasks ...task) task {
 	return t
 }
 
-func (p *PhysicalHashAgg) newPartialAggregate() (partialAgg, finalAgg *PhysicalHashAgg) {
+func (p *basePhysicalAgg) newPartialAggregate() (partial, final PhysicalPlan) {
 	// Check if this aggregation can push down.
 	sc := p.ctx.GetSessionVars().StmtCtx
 	client := p.ctx.GetClient()
 	for _, aggFunc := range p.AggFuncs {
 		pb := aggregation.AggFuncToPBExpr(sc, client, aggFunc)
 		if pb == nil {
-			return nil, p
+			return nil, p.self
 		}
 	}
 	_, _, remained := expression.ExpressionsToPB(sc, p.GroupByItems, client)
 	if len(remained) > 0 {
-		return nil, p
+		return nil, p.self
 	}
-	partialAgg = p
-	originalSchema := p.schema
-	// TODO: Refactor the way of constructing aggregation functions.
+
+	finalSchema := p.schema
 	partialSchema := expression.NewSchema()
-	partialAgg.SetSchema(partialSchema)
-	cursor := 0
-	finalAggFuncs := make([]aggregation.Aggregation, len(p.AggFuncs))
+	p.schema = partialSchema
+	partialAgg := p.self
+
+	// TODO: Refactor the way of constructing aggregation functions.
+	partialCursor := 0
+	finalAggFuncs := make([]*aggregation.AggFuncDesc, len(p.AggFuncs))
 	for i, aggFun := range p.AggFuncs {
-		fun := aggregation.NewAggFunction(aggFun.GetName(), nil, false)
-		var args []expression.Expression
-		colName := model.NewCIStr(fmt.Sprintf("col_%d", cursor))
-		if needCount(fun) {
+		finalAggFunc := &aggregation.AggFuncDesc{Name: aggFun.Name, HasDistinct: false}
+		args := make([]expression.Expression, 0, len(aggFun.Args))
+		if needCount(finalAggFunc) {
 			ft := types.NewFieldType(mysql.TypeLonglong)
-			ft.Flen = 21
-			ft.Charset = charset.CharsetBin
-			ft.Collate = charset.CollationBin
-			partialSchema.Append(&expression.Column{FromID: partialAgg.id, Position: cursor, ColName: colName, RetType: ft})
-			args = append(args, partialSchema.Columns[cursor].Clone())
-			cursor++
+			ft.Flen, ft.Charset, ft.Collate = 21, charset.CharsetBin, charset.CollationBin
+			partialSchema.Append(&expression.Column{
+				FromID:   p.ID(),
+				Position: partialCursor,
+				ColName:  model.NewCIStr(fmt.Sprintf("col_%d", partialCursor)),
+				RetType:  ft,
+			})
+			args = append(args, partialSchema.Columns[partialCursor].Clone())
+			partialCursor++
 		}
-		if needValue(fun) {
-			ft := originalSchema.Columns[i].GetType()
-			partialSchema.Append(&expression.Column{FromID: partialAgg.id, Position: cursor, ColName: colName, RetType: ft})
-			args = append(args, partialSchema.Columns[cursor].Clone())
-			cursor++
+		if needValue(finalAggFunc) {
+			partialSchema.Append(&expression.Column{
+				FromID:   p.ID(),
+				Position: partialCursor,
+				ColName:  model.NewCIStr(fmt.Sprintf("col_%d", partialCursor)),
+				RetType:  finalSchema.Columns[i].GetType(),
+			})
+			args = append(args, partialSchema.Columns[partialCursor].Clone())
+			partialCursor++
 		}
-		fun.SetArgs(args)
-		fun.SetMode(aggregation.FinalMode)
-		finalAggFuncs[i] = fun
+		finalAggFunc.Args = args
+		finalAggFunc.Mode = aggregation.FinalMode
+		finalAggFunc.RetTp = aggFun.RetTp
+		finalAggFuncs[i] = finalAggFunc
 	}
-	finalAgg = basePhysicalAgg{
-		AggFuncs: finalAggFuncs,
-	}.initForHash(p.ctx, p.stats)
-	finalAgg.SetSchema(originalSchema)
+
 	// add group by columns
+	groupByItems := make([]expression.Expression, 0, len(p.GroupByItems))
 	for i, gbyExpr := range p.GroupByItems {
 		gbyCol := &expression.Column{
-			FromID:   partialAgg.id,
-			Position: cursor + i,
+			FromID:   p.ID(),
+			Position: partialCursor + i,
+			ColName:  model.NewCIStr(fmt.Sprintf("col_%d", partialCursor+i)),
 			RetType:  gbyExpr.GetType(),
 		}
 		partialSchema.Append(gbyCol)
-		finalAgg.GroupByItems = append(finalAgg.GroupByItems, gbyCol.Clone())
+		groupByItems = append(groupByItems, gbyCol.Clone())
 	}
-	return
+
+	// Create physical "final" aggregation.
+	if p.tp == TypeStreamAgg {
+		finalAgg := basePhysicalAgg{
+			AggFuncs:     finalAggFuncs,
+			GroupByItems: groupByItems,
+		}.initForStream(p.ctx, p.stats)
+		finalAgg.schema = finalSchema
+		return partialAgg, finalAgg
+	}
+
+	finalAgg := basePhysicalAgg{
+		AggFuncs:     finalAggFuncs,
+		GroupByItems: groupByItems,
+	}.initForHash(p.ctx, p.stats)
+	finalAgg.schema = finalSchema
+	return partialAgg, finalAgg
 }
 
 func (p *PhysicalStreamAgg) attach2Task(tasks ...task) task {
@@ -492,8 +507,24 @@ func (p *PhysicalStreamAgg) attach2Task(tasks ...task) task {
 		return invalidTask
 	}
 	t := tasks[0].copy()
-	attachPlan2Task(p, t)
-	t.addCost(t.count() * cpuFactor)
+	if cop, ok := t.(*copTask); ok {
+		partialAgg, finalAgg := p.newPartialAggregate()
+		if partialAgg != nil {
+			if cop.tablePlan != nil {
+				partialAgg.SetChildren(cop.tablePlan)
+				cop.tablePlan = partialAgg
+			} else {
+				partialAgg.SetChildren(cop.indexPlan)
+				cop.indexPlan = partialAgg
+			}
+		}
+		t = finishCopTask(cop, p.ctx)
+		attachPlan2Task(finalAgg, t)
+		t.addCost(t.count() * cpuFactor)
+	} else {
+		attachPlan2Task(p, t)
+		t.addCost(t.count() * cpuFactor)
+	}
 	return t
 }
 
